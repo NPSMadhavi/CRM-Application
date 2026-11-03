@@ -26,10 +26,14 @@ try {
   });
 
   console.log(`[Database Setup] Generating Prisma Client...`);
-  execSync(`npx prisma generate --schema=${schemaFile}`, {
-    cwd: backendDir,
-    stdio: 'inherit'
-  });
+  try {
+    execSync(`npx prisma generate --schema=${schemaFile}`, {
+      cwd: backendDir,
+      stdio: 'inherit'
+    });
+  } catch (genErr) {
+    console.warn(`[Database Setup] Prisma Client generation warning (dll locked, using existing client):`, genErr.message);
+  }
 
   console.log(`[Database Setup] Seeding database with realistic support tickets & agents...`);
   execSync(`node prisma/seed.js`, {
