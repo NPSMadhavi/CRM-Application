@@ -1,0 +1,278 @@
+// Prisma Schema for Customer IT Support & Ticket Management CRM
+// Configured for PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  TIER_1_AGENT
+  TIER_2_AGENT
+  AGENT
+}
+
+enum TicketStatus {
+  NEW
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  WAITING_FOR_CUSTOMER
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TicketCategory {
+  HARDWARE
+  SOFTWARE
+  NETWORK
+  ACCOUNT_ACCESS
+  BILLING
+  GENERAL_INQUIRY
+}
+
+enum Channel {
+  WHATSAPP
+  EMAIL
+  PORTAL
+}
+
+enum Sentiment {
+  CALM
+  FRUSTRATED
+  ANGRY
+  URGENT
+}
+
+enum SenderType {
+  CUSTOMER
+  AGENT
+  SYSTEM
+}
+
+model User {
+  id           String          @id @default(uuid())
+  email        String          @unique
+  passwordHash String
+  fullName     String
+  role         UserRole        @default(AGENT)
+  department   String?         @default("IT Support")
+  avatarUrl    String?
+  phone        String?
+  isActive     Boolean         @default(true)
+  tickets      Ticket[]        @relation("AssignedTickets")
+  notes        TicketNote[]
+  auditLogs    TicketAuditLog[]
+  notifications Notification[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+}
+
+model Customer {
+  id                 String    @id @default(uuid())
+  name               String
+  email              String?   @unique
+  phone              String?   @unique
+  company            String?
+  isVip              Boolean   @default(false)
+  avatarUrl          String?
+  notes              String?
+  sourceChannel      Channel   @default(EMAIL)
+  
+  // Support Working Hours & Contract Plan
+  supportPlanType    String    @default("ADHOC_4H")
+  supportPlanName    String    @default("Ad-hoc 4-Hour Pack")
+  allocatedHours     Float     @default(4.0)
+  usedHours          Float     @default(0.0)
+  hourlyRate         Float     @default(85.0)
+  workingHoursWindow String    @default("MON_FRI_9AM_6PM")
+  planStatus         String    @default("ACTIVE")
+  planRenewalDate    DateTime?
+
+  tickets            Ticket[]
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([email])
+  @@index([phone])
+}
+
+model Ticket {
+  id               String          @id @default(uuid())
+  ticketNumber     String          @unique
+  title            String
+  description      String
+  status           TicketStatus    @default(NEW)
+  priority         TicketPriority  @default(MEDIUM)
+  category         TicketCategory  @default(GENERAL_INQUIRY)
+  channel          Channel         @default(EMAIL)
+  sourceIdentifier String?
+  aiExtracted      Boolean         @default(false)
+  aiConfidence     Float?          @default(0.0)
+  aiSummary        String?
+  sentiment        Sentiment       @default(CALM)
+  
+  customerId       String
+  customer         Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  
+  assignedToId     String?
+  assignedTo       User?           @relation("AssignedTickets", fields: [assignedToId], references: [id], onDelete: SetNull)
+  
+  resolutionNotes  String?
+  resolvedAt       DateTime?
+  closedAt         DateTime?
+  firstResponseAt  DateTime?
+  
+  slaBreached      Boolean         @default(false)
+  slaResponseDue   DateTime?
+  slaResolutionDue DateTime?
+
+  // Time tracking & Work logs for support hour calculation
+  totalTimeHours   Float           @default(0.0)
+  workLogs         TicketWorkLog[]
+
+  messages         TicketMessage[]
+  notes            TicketNote[]
+  auditLogs        TicketAuditLog[]
+  notifications    Notification[]
+
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([status])
+  @@index([priority])
+  @@index([category])
+  @@index([channel])
+  @@index([assignedToId])
+  @@index([customerId])
+}
+
+model TicketWorkLog {
+  id             String    @id @default(uuid())
+  ticketId       String
+  ticket         Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  agentId        String?
+  agentName      String
+  durationHours  Float     @default(0.5)
+  description    String
+  isBillable     Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+
+  @@index([ticketId])
+}
+
+model SupportPlanConfig {
+  id                 String    @id @default(uuid())
+  code               String    @unique
+  name               String
+  description        String?
+  hoursIncluded      Float     @default(4.0)
+  hourlyRate         Float     @default(85.0)
+  monthlyPrice       Float     @default(340.0)
+  workingHoursWindow String    @default("MON_FRI_9AM_6PM")
+  slaResponseHours   Int       @default(4)
+  slaResolutionHours Int       @default(24)
+  isAdhoc            Boolean   @default(false)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+}
+
+model TicketMessage {
+  id                String     @id @default(uuid())
+  ticketId          String
+  ticket            Ticket     @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderType        SenderType @default(CUSTOMER)
+  senderName        String
+  senderEmail       String?
+  senderPhone       String?
+  channel           Channel    @default(EMAIL)
+  body              String
+  externalMessageId String?    @unique
+  attachments       String?    // JSON array of attachment objects
+  createdAt         DateTime   @default(now())
+
+  @@index([ticketId])
+  @@index([externalMessageId])
+}
+
+model TicketNote {
+  id        String   @id @default(uuid())
+  ticketId  String
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  content   String
+  isPrivate Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+}
+
+model TicketAuditLog {
+  id           String   @id @default(uuid())
+  ticketId     String
+  ticket       Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  actorId      String?
+  actor        User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  actorName    String
+  action       String   // e.g., "CREATED", "STATUS_CHANGED", "ASSIGNED", "NOTE_ADDED", "REPLY_SENT", "AI_DETECTED"
+  fieldChanged String?
+  oldValue     String?
+  newValue     String?
+  details      String?
+  createdAt    DateTime @default(now())
+
+  @@index([ticketId])
+}
+
+model CategoryConfig {
+  id                 String         @id @default(uuid())
+  category           TicketCategory @unique
+  name               String
+  description        String?
+  slaResponseHours   Int            @default(4)
+  slaResolutionHours Int            @default(24)
+  defaultPriority    TicketPriority @default(MEDIUM)
+  isActive           Boolean        @default(true)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+}
+
+model Notification {
+  id          String   @id @default(uuid())
+  recipientId String?  // Null means all agents
+  recipient   User?    @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  ticketId    String?
+  ticket      Ticket?  @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  title       String
+  message     String
+  type        String   // TICKET_CREATED, TICKET_ASSIGNED, STATUS_CHANGED, SLA_WARNING, MESSAGE_RECEIVED
+  isRead      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([recipientId])
+}
+
+model WebhookLog {
+  id           String   @id @default(uuid())
+  channel      Channel
+  eventType    String
+  payload      String   // JSON string
+  status       String   // SUCCESS, PROCESSED, FAILED, DUPLICATE_IGNORED
+  ticketId     String?
+  errorMessage String?
+  createdAt    DateTime @default(now())
+}
+

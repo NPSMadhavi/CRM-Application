@@ -1,0 +1,18 @@
+{
+  "name": "support-ticket-crm",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Customer IT Support & Ticket Management CRM",
+  "scripts": {
+    "docker:up": "docker-compose up --build",
+    "docker:down": "docker-compose down",
+    "install:backend": "cd backend && npm install",
+    "install:frontend": "cd frontend && npm install",
+    "install:all": "npm run install:backend && npm run install:frontend",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "prisma:generate": "cd backend && npx prisma generate",
+    "prisma:push": "cd backend && npx prisma db push",
+    "prisma:seed": "cd backend && node prisma/seed.js"
+  }
+}
