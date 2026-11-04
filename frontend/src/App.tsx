@@ -16,15 +16,24 @@ import api from './services/api';
 import { Ticket, DashboardStats, User } from './types';
 import { getSocket } from './services/socket';
 import { Sparkles, Ticket as TicketIcon, Radio, Users, Plus } from 'lucide-react';
+import { GlobalNotificationContainer } from './components/notifications/GlobalNotificationContainer';
+import { useNotification } from './context/NotificationContext';
 
 export const App: React.FC = () => {
   const { isAuthenticated, isLoading: authLoading } = useAuth();
   const { theme } = useTheme();
+  const { setOnSelectTicketCallback } = useNotification();
 
   const [currentTab, setCurrentTab] = useState<string>('dashboard');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null);
   const [showCreateTicketModal, setShowCreateTicketModal] = useState(false);
+
+  useEffect(() => {
+    setOnSelectTicketCallback((ticketId: string) => {
+      setSelectedTicketId(ticketId);
+    });
+  }, [setOnSelectTicketCallback]);
 
   // Tickets & Stats state
   const [tickets, setTickets] = useState<Ticket[]>([]);
@@ -319,6 +328,9 @@ export const App: React.FC = () => {
         }}
         agents={agents}
       />
+
+      {/* Antigravity Global Real-Time Notification Container */}
+      <GlobalNotificationContainer />
     </div>
   );
 };

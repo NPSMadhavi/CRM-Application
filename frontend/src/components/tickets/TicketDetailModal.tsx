@@ -335,18 +335,20 @@ export const TicketDetailModal: React.FC<TicketDetailModalProps> = ({
             {/* Tab 1: Conversation Messages Stream */}
             {activeTab === 'conversation' && (
               <div className="flex-1 p-5 space-y-4 overflow-y-auto max-h-[380px]">
-                {/* Initial Description */}
-                <div className="p-4 rounded-2xl bg-white dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 shadow-sm">
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-2">
-                    <span className="font-semibold text-slate-800 dark:text-slate-200">
-                      {ticket?.customer?.name} (Original Request)
-                    </span>
-                    <span>{ticket ? new Date(ticket.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</span>
+                {/* Initial Description rendered only when no message stream exists */}
+                {(!ticket?.messages || ticket.messages.length === 0) && ticket?.description && (
+                  <div className="p-4 rounded-2xl bg-white dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 shadow-sm">
+                    <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-2">
+                      <span className="font-semibold text-slate-800 dark:text-slate-200">
+                        {ticket?.customer?.name} (Original Request)
+                      </span>
+                      <span>{ticket ? new Date(ticket.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</span>
+                    </div>
+                    <p className="text-xs text-slate-800 dark:text-slate-200 leading-relaxed whitespace-pre-wrap">
+                      {ticket?.description}
+                    </p>
                   </div>
-                  <p className="text-xs text-slate-800 dark:text-slate-200 leading-relaxed whitespace-pre-wrap">
-                    {ticket?.description}
-                  </p>
-                </div>
+                )}
 
                 {/* Messages & Notes Stream */}
                 {ticket?.messages?.map((msg) => {

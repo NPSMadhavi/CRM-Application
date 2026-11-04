@@ -2,6 +2,7 @@ import { prisma } from '../config/db.js';
 import { updateTicketStatus, assignTicket, sendAgentReply, addInternalNote } from '../services/ticketService.js';
 import { calculateCustomerPlanMetrics, logTicketWork } from '../services/supportPlanService.js';
 import { emitToAll } from '../config/socket.js';
+import { NotificationService } from '../services/notificationService.js';
 
 export async function getTickets(req, res, next) {
   try {
@@ -209,7 +210,7 @@ export async function createManualTicket(req, res, next) {
             senderType: 'AGENT',
             senderName: req.user.fullName,
             senderEmail: req.user.email,
-            channel: 'INTERNAL',
+            channel: channel || 'PORTAL',
             body: description
           }
         },
@@ -230,6 +231,13 @@ export async function createManualTicket(req, res, next) {
     });
 
     emitToAll('ticket:created', { ticket: newTicket });
+
+    await NotificationService.createAndDispatch({
+      ticketId: newTicket.id,
+      title: `New ${channel} Ticket #${newTicket.ticketNumber}`,
+      message: `${customer.name}: ${newTicket.title}`,
+      type: 'TICKET_CREATED'
+    });
 
     res.status(201).json({ success: true, ticket: newTicket });
   } catch (error) {

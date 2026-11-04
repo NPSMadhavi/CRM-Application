@@ -2,6 +2,9 @@ import { prisma } from '../config/db.js';
 import { detectTicketDetails } from './aiService.js';
 import { sendWhatsAppMessage } from './whatsappService.js';
 import { sendEmail } from './emailService.js';
+import { generateAgentReplyEmail, generateAcknowledgementEmail } from './email-template.service.js';
+import { extractCleanReply } from './email-reply-parser.service.js';
+import { NotificationService } from './notificationService.js';
 import { emitToAll, emitToTicket } from '../config/socket.js';
 import { logger } from '../utils/logger.js';
 
@@ -41,8 +44,6 @@ function calculateSLADeadlines(category, priority) {
 
 /**
  * Process incoming message from any channel (WhatsApp or Email)
- * Handles deduplication, AI entity detection, customer linking, ticket creation,
- * automatic acknowledgement, and real-time dashboard notification.
  */
 export async function processIncomingMessage({
   channel,
@@ -118,8 +119,6 @@ export async function processIncomingMessage({
   }
 
   // 4. CHECK FOR EXISTING OPEN TICKET (Conversation Threading)
-  // If customer has an active ticket (NEW, OPEN, ASSIGNED, IN_PROGRESS, WAITING_FOR_CUSTOMER),
-  // append incoming message to that thread rather than cluttering with duplicate tickets.
   const activeTicket = await prisma.ticket.findFirst({
     where: {
       customerId: customer.id,
@@ -134,6 +133,9 @@ export async function processIncomingMessage({
   if (activeTicket) {
     logger.info(`[TicketService] Customer has open ticket #${activeTicket.ticketNumber}. Appending follow-up message.`);
 
+    // Extract clean reply without quoted previous text for Email channel
+    const cleanBody = channel === 'EMAIL' ? extractCleanReply(messageText) : messageText;
+
     // Create message under existing ticket
     const newMsg = await prisma.ticketMessage.create({
       data: {
@@ -143,13 +145,13 @@ export async function processIncomingMessage({
         senderEmail: finalCustomerEmail,
         senderPhone: finalCustomerPhone,
         channel,
-        body: messageText,
+        body: cleanBody,
         externalMessageId: messageId,
         attachments: attachments.length ? JSON.stringify(attachments) : null
       }
     });
 
-    // Update ticket status to WAITING_FOR_CUSTOMER if it was in waiting, or update timestamp
+    // Update ticket status
     const updatedTicket = await prisma.ticket.update({
       where: { id: activeTicket.id },
       data: {
@@ -174,12 +176,15 @@ export async function processIncomingMessage({
       }
     });
 
-    // Realtime notification
+    // Dispatch customer reply notification
+    await NotificationService.notifyCustomerReply(updatedTicket, customer, newMsg);
+
     emitToTicket(activeTicket.id, 'message:received', {
       ticketId: activeTicket.id,
       message: newMsg,
       ticket: updatedTicket
     });
+    emitToAll('ticket:updated', { ticket: updatedTicket });
 
     return {
       isNewTicket: false,
@@ -189,9 +194,9 @@ export async function processIncomingMessage({
   }
 
   // 5. CREATE NEW TICKET
+  // STRICT RULE: All new tickets from incoming emails must have status = OPEN, assignedToId = null, channel = EMAIL
   const ticketNumber = await generateTicketNumber();
   const { slaResponseDue, slaResolutionDue } = calculateSLADeadlines(aiResult.category, aiResult.priority);
-
   const ticketTitle = subject || aiResult.title || `${aiResult.category} Issue from ${finalCustomerName}`;
 
   const newTicket = await prisma.ticket.create({
@@ -199,7 +204,7 @@ export async function processIncomingMessage({
       ticketNumber,
       title: ticketTitle,
       description: messageText,
-      status: 'NEW',
+      status: channel === 'EMAIL' ? 'OPEN' : 'NEW',
       priority: aiResult.priority,
       category: aiResult.category,
       channel,
@@ -209,6 +214,7 @@ export async function processIncomingMessage({
       aiSummary: aiResult.summary,
       sentiment: aiResult.sentiment,
       customerId: customer.id,
+      assignedToId: null, // STRICT RULE: unassigned
       slaResponseDue,
       slaResolutionDue,
       messages: {
@@ -249,57 +255,68 @@ export async function processIncomingMessage({
 
   logger.info(`[TicketService] Created Ticket #${newTicket.ticketNumber} [${newTicket.category}] Priority: ${newTicket.priority}`);
 
-  // 6. AUTOMATIC CUSTOMER ACKNOWLEDGEMENT (Feature 3)
-  const acknowledgementText = `We have received your support request. Your Ticket ID is #${newTicket.ticketNumber}. Our support team will contact you within a few hours.`;
+  // Send acknowledgement if email or whatsapp
+  if (channel === 'WHATSAPP' && finalCustomerPhone) {
+    const ackMsg = `Hello ${finalCustomerName}, we have received your request regarding "${ticketTitle}". Your Ticket ID is #${newTicket.ticketNumber}. A support agent will assist you shortly.`;
+    await sendWhatsAppMessage(finalCustomerPhone, ackMsg);
+  } else if (channel === 'EMAIL' && finalCustomerEmail) {
+    const { subject: ackSubject, html: ackHtml, text: ackText } = generateAcknowledgementEmail({
+      ticket: newTicket,
+      customer
+    });
+    const ackResult = await sendEmail({
+      to: finalCustomerEmail,
+      subject: ackSubject,
+      text: ackText,
+      html: ackHtml,
+      inReplyTo: messageId || undefined,
+      references: messageId || undefined,
+      ticketId: newTicket.id
+    });
 
-  try {
-    if (channel === 'WHATSAPP' && finalCustomerPhone) {
-      await sendWhatsAppMessage(finalCustomerPhone, acknowledgementText);
-    } else if (channel === 'EMAIL' && finalCustomerEmail) {
-      await sendEmail({
-        to: finalCustomerEmail,
-        subject: `[Ticket #${newTicket.ticketNumber}] We have received your request: ${newTicket.title}`,
-        text: acknowledgementText
-      });
-    }
-
-    // Record acknowledgement in conversation history
-    await prisma.ticketMessage.create({
+    const sysMsg = await prisma.ticketMessage.create({
       data: {
         ticketId: newTicket.id,
         senderType: 'SYSTEM',
-        senderName: 'Auto-Acknowledgement Bot',
-        channel,
-        body: acknowledgementText
+        senderName: 'System',
+        senderEmail: process.env.SMTP_FROM_EMAIL || 'chandra2001ks@gmail.com',
+        channel: 'EMAIL',
+        body: ackText,
+        externalMessageId: ackResult.messageId || null
       }
     });
+
+    if (ackResult.emailRecordId) {
+      await prisma.emailMessage.update({
+        where: { id: ackResult.emailRecordId },
+        data: { ticketMessageId: sysMsg.id }
+      });
+    }
 
     await prisma.ticketAuditLog.create({
       data: {
         ticketId: newTicket.id,
-        actorName: 'System Bot',
+        actorName: 'System (Email Service)',
         action: 'ACKNOWLEDGEMENT_SENT',
-        details: `Sent automated receipt confirmation via ${channel}`
+        details: `Automated acknowledgement email sent to ${finalCustomerEmail}`
       }
     });
-  } catch (ackErr) {
-    logger.warn('[TicketService] Failed to send automatic acknowledgement:', ackErr.message);
   }
 
-  // 7. REAL-TIME DASHBOARD NOTIFICATION (Feature 4 & 9)
-  const notification = await prisma.notification.create({
-    data: {
+  // Dispatch notification
+  if (channel === 'EMAIL') {
+    await NotificationService.notifyNewEmailTicket(newTicket, customer, newTicket.messages[0]);
+  } else {
+    await NotificationService.createAndDispatch({
       ticketId: newTicket.id,
-      title: `New ${newTicket.priority} Ticket #${newTicket.ticketNumber}`,
-      message: `${newTicket.customer.name} reported: "${newTicket.title}"`,
-      type: 'TICKET_CREATED'
-    }
-  });
+      title: `New ${channel} Ticket #${newTicket.ticketNumber}`,
+      message: `${customer.name}: ${newTicket.title}`,
+      type: 'TICKET_CREATED',
+      link: null
+    });
+  }
 
-  emitToAll('ticket:created', {
-    ticket: newTicket,
-    notification
-  });
+  emitToAll('ticket:created', { ticket: newTicket });
 
   return {
     isNewTicket: true,
@@ -363,10 +380,14 @@ export async function updateTicketStatus(ticketId, newStatus, user, resolutionNo
       await sendEmail({
         to: updatedTicket.customer.email,
         subject: `[Resolved] Ticket #${updatedTicket.ticketNumber}: ${updatedTicket.title}`,
-        text: notifyMsg
+        text: notifyMsg,
+        ticketId: updatedTicket.id
       });
     }
   }
+
+  // Dispatch real-time SSE notification
+  await NotificationService.notifyStatusChanged(updatedTicket, oldStatus, newStatus, user);
 
   // Socket notification
   emitToTicket(ticketId, 'ticket:updated', { ticket: updatedTicket, oldStatus, newStatus });
@@ -408,19 +429,11 @@ export async function assignTicket(ticketId, agentId, actorUser) {
     }
   });
 
-  // Notification for agent
-  const notif = await prisma.notification.create({
-    data: {
-      recipientId: agentId,
-      ticketId,
-      title: `Ticket #${updatedTicket.ticketNumber} Assigned`,
-      message: `You were assigned ticket: "${updatedTicket.title}"`,
-      type: 'TICKET_ASSIGNED'
-    }
-  });
+  // Dispatch real-time SSE notification
+  await NotificationService.notifyTicketAssigned(updatedTicket, agent, actorUser);
 
   emitToTicket(ticketId, 'ticket:updated', { ticket: updatedTicket, assignedTo: agent });
-  emitToAll('notification:new', notif);
+  emitToAll('ticket:updated', { ticket: updatedTicket });
 
   return updatedTicket;
 }
@@ -437,16 +450,43 @@ export async function sendAgentReply({ ticketId, user, body, channel }) {
   if (!ticket) throw new Error('Ticket not found');
 
   const targetChannel = channel || ticket.channel;
+  let outboundResult = { success: true };
 
   // Send message to customer via chosen channel
   if (targetChannel === 'WHATSAPP' && ticket.customer.phone) {
-    await sendWhatsAppMessage(ticket.customer.phone, body);
+    outboundResult = await sendWhatsAppMessage(ticket.customer.phone, body);
   } else if (targetChannel === 'EMAIL' && ticket.customer.email) {
-    await sendEmail({
-      to: ticket.customer.email,
-      subject: `Re: [Ticket #${ticket.ticketNumber}] ${ticket.title}`,
-      text: body
+    // Find last incoming email for threading headers
+    const lastIncomingEmail = await prisma.emailMessage.findFirst({
+      where: { ticketId, direction: 'INBOUND' },
+      orderBy: { createdAt: 'desc' }
     });
+
+    const inReplyTo = lastIncomingEmail?.messageId || lastIncomingEmail?.providerMessageId || undefined;
+    const references = lastIncomingEmail
+      ? (lastIncomingEmail.references ? `${lastIncomingEmail.references} ${inReplyTo}` : inReplyTo)
+      : undefined;
+
+    const { subject: emailSubject, html: emailHtml, text: emailText } = generateAgentReplyEmail({
+      ticket,
+      customer: ticket.customer,
+      agent: user,
+      responseText: body
+    });
+
+    outboundResult = await sendEmail({
+      to: ticket.customer.email,
+      subject: emailSubject,
+      text: emailText,
+      html: emailHtml,
+      inReplyTo,
+      references,
+      ticketId: ticket.id
+    });
+
+    if (!outboundResult.success) {
+      throw new Error(`Failed to send email to customer: ${outboundResult.error}`);
+    }
   }
 
   // Create message record
@@ -457,15 +497,26 @@ export async function sendAgentReply({ ticketId, user, body, channel }) {
       senderName: user.fullName,
       senderEmail: user.email,
       channel: targetChannel,
-      body
+      body,
+      externalMessageId: outboundResult.messageId || null
     }
   });
 
-  // Update ticket firstResponseAt if not already recorded
+  // Link outbound EmailMessage to TicketMessage
+  if (outboundResult.emailRecordId) {
+    await prisma.emailMessage.update({
+      where: { id: outboundResult.emailRecordId },
+      data: { ticketMessageId: msg.id }
+    });
+  }
+
+  // Update ticket firstResponseAt and status transition to WAITING_FOR_CUSTOMER
   const isFirstResponse = !ticket.firstResponseAt;
   const updateData = {
     updatedAt: new Date(),
-    status: ticket.status === 'NEW' || ticket.status === 'ASSIGNED' ? 'IN_PROGRESS' : ticket.status
+    status: (ticket.status === 'NEW' || ticket.status === 'OPEN' || ticket.status === 'ASSIGNED')
+      ? 'WAITING_FOR_CUSTOMER'
+      : ticket.status
   };
   if (isFirstResponse) {
     updateData.firstResponseAt = new Date();
@@ -498,12 +549,13 @@ export async function sendAgentReply({ ticketId, user, body, channel }) {
     message: msg,
     ticket: updatedTicket
   });
+  emitToAll('ticket:updated', { ticket: updatedTicket });
 
   return { message: msg, ticket: updatedTicket };
 }
 
 /**
- * Add internal agent note (private)
+ * Add internal agent note (private - never sent via SMTP)
  */
 export async function addInternalNote({ ticketId, user, content }) {
   const note = await prisma.ticketNote.create({
@@ -540,4 +592,3 @@ export async function addInternalNote({ ticketId, user, content }) {
 
   return note;
 }
-

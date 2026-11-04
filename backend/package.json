@@ -20,12 +20,16 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "imapflow": "^2.10.0",
     "jsonwebtoken": "^9.0.2",
+    "mailparser": "^3.14.1",
     "nodemailer": "^6.9.16",
     "socket.io": "^4.8.1",
     "uuid": "^11.0.5"
   },
   "devDependencies": {
-    "prisma": "^5.22.0"
+    "prisma": "^5.22.0",
+    "supertest": "^7.3.1",
+    "vitest": "^5.1.0"
   }
 }
