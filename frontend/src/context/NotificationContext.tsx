@@ -1,128 +1,319 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
+import api from '../services/api';
+import { useAuth } from './AuthContext';
+import { AppNotification } from '../types';
 import { getSocket } from '../services/socket';
-import { AppNotification, Ticket } from '../types';
 
-interface ToastItem {
+export interface ToastNotification {
   id: string;
   title: string;
   message: string;
-  type: 'info' | 'success' | 'warning' | 'error';
+  type: string;
+  ticketNumber?: string;
   ticketId?: string;
+  customerName?: string;
+  subject?: string;
+  channel?: string;
+  priority?: string;
+  description?: string;
+  link?: string | null;
+  createdAt: string;
+  autoDismissMs?: number;
 }
 
 interface NotificationContextType {
   notifications: AppNotification[];
   unreadCount: number;
-  toasts: ToastItem[];
-  markAsRead: (id: string) => void;
-  markAllAsRead: () => void;
+  toasts: ToastNotification[];
+  markAsRead: (id: string) => Promise<void>;
+  markAllAsRead: () => Promise<void>;
   dismissToast: (id: string) => void;
-  addToast: (toast: Omit<ToastItem, 'id'>) => void;
+  clickToast: (toast: ToastNotification) => void;
+  addToast: (toast: Partial<ToastNotification>) => void;
+  refreshNotifications: () => Promise<void>;
+  setOnSelectTicketCallback: (cb: (ticketId: string) => void) => void;
 }
 
 const NotificationContext = createContext<NotificationContextType | undefined>(undefined);
 
+const MAX_VISIBLE_TOASTS = 5;
+const DEFAULT_AUTO_DISMISS_MS = 7000;
+
 export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [notifications, setNotifications] = useState<AppNotification[]>([
-    {
-      id: 'notif-1',
-      title: 'System Initialized',
-      message: 'IT Support CRM is listening for WhatsApp & Email tickets.',
-      type: 'TICKET_CREATED',
-      isRead: false,
-      createdAt: new Date().toISOString()
+  const { user, token, isAuthenticated } = useAuth();
+
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+  const [toasts, setToasts] = useState<ToastNotification[]>([]);
+
+  const queueRef = useRef<ToastNotification[]>([]);
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  const onSelectTicketRef = useRef<((ticketId: string) => void) | null>(null);
+
+  const setOnSelectTicketCallback = useCallback((cb: (ticketId: string) => void) => {
+    onSelectTicketRef.current = cb;
+  }, []);
+
+  // Helper to extract ticket number e.g. TIC-1042 or CRM-000125
+  const extractTicketNumber = (title: string, message: string): string | undefined => {
+    const match = `${title} ${message}`.match(/(?:TIC|CRM)[-_ ]?\d+/i);
+    return match ? match[0].toUpperCase().replace(/\s+/, '-') : undefined;
+  };
+
+  // Load persistent notifications from PostgreSQL
+  const refreshNotifications = useCallback(async () => {
+    if (!isAuthenticated) return;
+    try {
+      const [notifRes, countRes] = await Promise.all([
+        api.get('/notifications?limit=30'),
+        api.get('/notifications/unread-count')
+      ]);
+
+      if (notifRes.data.success) {
+        setNotifications(notifRes.data.data);
+      }
+      if (countRes.data.success) {
+        setUnreadCount(countRes.data.unreadCount ?? countRes.data.count ?? 0);
+      }
+    } catch (err) {
+      console.warn('Failed to fetch notifications:', err);
     }
-  ]);
+  }, [isAuthenticated]);
 
-  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  useEffect(() => {
+    if (isAuthenticated) {
+      refreshNotifications();
+    } else {
+      setNotifications([]);
+      setUnreadCount(0);
+      setToasts([]);
+    }
+  }, [isAuthenticated, refreshNotifications]);
 
-  const addToast = (toast: Omit<ToastItem, 'id'>) => {
-    const id = `toast-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    const newToast: ToastItem = { ...toast, id };
-    setToasts((prev) => [newToast, ...prev].slice(0, 5));
-
-    // Auto dismiss after 6 seconds
-    setTimeout(() => {
-      dismissToast(id);
-    }, 6000);
-  };
-
-  const dismissToast = (id: string) => {
+  // Dismiss a floating toast
+  const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
-  };
 
-  const markAsRead = (id: string) => {
+    // Broadcast dismiss to other browser tabs
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage({ type: 'DISMISS_TOAST', id });
+    }
+
+    // Pull next queued toast into visible stack
+    setTimeout(() => {
+      if (queueRef.current.length > 0) {
+        const nextToast = queueRef.current.shift()!;
+        setToasts((prev) => {
+          if (prev.length < MAX_VISIBLE_TOASTS && !prev.some((t) => t.id === nextToast.id)) {
+            return [...prev, nextToast];
+          }
+          return prev;
+        });
+      }
+    }, 100);
+  }, []);
+
+  // Mark single notification as read
+  const markAsRead = useCallback(async (id: string) => {
     setNotifications((prev) =>
       prev.map((n) => (n.id === id ? { ...n, isRead: true } : n))
     );
-  };
+    setUnreadCount((prev) => Math.max(0, prev - 1));
 
-  const markAllAsRead = () => {
-    setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
-  };
-
-  useEffect(() => {
-    const socket = getSocket();
-
-    // 1. Listen for new tickets
-    const handleTicketCreated = (data: { ticket: Ticket; notification?: AppNotification }) => {
-      const ticket = data.ticket;
-      const notifItem: AppNotification = {
-        id: `notif-${Date.now()}`,
-        title: `New ${ticket.channel} Ticket #${ticket.ticketNumber}`,
-        message: `${ticket.customer.name}: ${ticket.title}`,
-        type: 'TICKET_CREATED',
-        ticketId: ticket.id,
-        isRead: false,
-        createdAt: new Date().toISOString()
-      };
-
-      setNotifications((prev) => [notifItem, ...prev]);
-
-      addToast({
-        title: `⚡ New Ticket #${ticket.ticketNumber} [${ticket.priority}]`,
-        message: `${ticket.title} (${ticket.channel})`,
-        type: ticket.priority === 'CRITICAL' ? 'error' : 'info',
-        ticketId: ticket.id
-      });
-    };
-
-    // 2. Listen for ticket updates
-    const handleTicketUpdated = (data: { ticket: Ticket; oldStatus?: string; newStatus?: string }) => {
-      if (data.newStatus) {
-        addToast({
-          title: `Ticket #${data.ticket.ticketNumber} Status Changed`,
-          message: `Updated to ${data.newStatus}`,
-          type: 'success',
-          ticketId: data.ticket.id
-        });
+    try {
+      await api.patch(`/notifications/${id}/read`);
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({ type: 'SYNC_UNREAD_COUNT' });
       }
-    };
-
-    // 3. Listen for incoming message
-    const handleMessageReceived = (data: { ticketId: string; message: any; ticket: Ticket }) => {
-      if (data.message.senderType === 'CUSTOMER') {
-        addToast({
-          title: `💬 New Reply on #${data.ticket?.ticketNumber || 'Ticket'}`,
-          message: `${data.message.senderName}: "${data.message.body.substring(0, 50)}..."`,
-          type: 'info',
-          ticketId: data.ticketId
-        });
-      }
-    };
-
-    socket.on('ticket:created', handleTicketCreated);
-    socket.on('ticket:updated', handleTicketUpdated);
-    socket.on('message:received', handleMessageReceived);
-
-    return () => {
-      socket.off('ticket:created', handleTicketCreated);
-      socket.off('ticket:updated', handleTicketUpdated);
-      socket.off('message:received', handleMessageReceived);
-    };
+    } catch (err) {
+      console.warn('Failed to mark notification read on backend:', err);
+    }
   }, []);
 
-  const unreadCount = notifications.filter((n) => !n.isRead).length;
+  // Mark all notifications as read
+  const markAllAsRead = useCallback(async () => {
+    setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
+    setUnreadCount(0);
+
+    try {
+      await api.patch('/notifications/read-all');
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({ type: 'SYNC_UNREAD_COUNT' });
+      }
+    } catch (err) {
+      console.warn('Failed to mark all notifications read:', err);
+    }
+  }, []);
+
+  // Click on toast: dismiss, mark read, navigate to ticket
+  const clickToast = useCallback(
+    async (toast: ToastNotification) => {
+      dismissToast(toast.id);
+      await markAsRead(toast.id);
+
+      // Open ticket in UI if callback registered
+      if (toast.ticketId && onSelectTicketRef.current) {
+        onSelectTicketRef.current(toast.ticketId);
+      }
+    },
+    [dismissToast, markAsRead]
+  );
+
+  // Add toast with max-5 visible stack and queuing
+  const addToast = useCallback((raw: Partial<ToastNotification>) => {
+    const id = raw.id || `toast-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+
+    // Deduplicate against seen IDs
+    if (seenIdsRef.current.has(id)) {
+      return;
+    }
+    seenIdsRef.current.add(id);
+
+    const ticketNumber = raw.ticketNumber || extractTicketNumber(raw.title || '', raw.message || '');
+    const newToast: ToastNotification = {
+      id,
+      title: raw.title || 'Notification',
+      message: raw.message || '',
+      type: raw.type || 'INFO',
+      ticketNumber,
+      ticketId: raw.ticketId,
+      customerName: raw.customerName,
+      subject: raw.subject,
+      channel: raw.channel || 'EMAIL',
+      priority: raw.priority || 'MEDIUM',
+      description: raw.description,
+      link: raw.link,
+      createdAt: raw.createdAt || new Date().toISOString(),
+      autoDismissMs: DEFAULT_AUTO_DISMISS_MS
+    };
+
+    setToasts((prev) => {
+      if (prev.length < MAX_VISIBLE_TOASTS) {
+        return [...prev, newToast];
+      } else {
+        queueRef.current.push(newToast);
+        return prev;
+      }
+    });
+
+    // Update notifications list & unread count in bell dropdown
+    setNotifications((prev) => [
+      {
+        id: newToast.id,
+        title: newToast.title,
+        message: newToast.message,
+        type: newToast.type,
+        ticketId: newToast.ticketId,
+        isRead: false,
+        createdAt: newToast.createdAt
+      },
+      ...prev
+    ]);
+    setUnreadCount((prev) => prev + 1);
+  }, []);
+
+  // Multi-tab synchronization using BroadcastChannel
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+
+    const bc = new BroadcastChannel('crm_notifications_sync');
+    broadcastChannelRef.current = bc;
+
+    bc.onmessage = (event) => {
+      const data = event.data;
+      if (!data) return;
+
+      if (data.type === 'NEW_NOTIFICATION') {
+        addToast(data.payload);
+      } else if (data.type === 'DISMISS_TOAST') {
+        setToasts((prev) => prev.filter((t) => t.id !== data.id));
+      } else if (data.type === 'SYNC_UNREAD_COUNT') {
+        refreshNotifications();
+      }
+    };
+
+    return () => {
+      bc.close();
+      broadcastChannelRef.current = null;
+    };
+  }, [addToast, refreshNotifications]);
+
+  // Connect to SSE Stream when authenticated
+  useEffect(() => {
+    if (!token || !user) {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      return;
+    }
+
+    const sseUrl = `/api/v1/notifications/stream?token=${encodeURIComponent(token)}`;
+    const es = new EventSource(sseUrl);
+    eventSourceRef.current = es;
+
+    es.addEventListener('connected', () => {
+      console.log('[SSE] Connected to real-time notification stream');
+    });
+
+    es.addEventListener('notification', (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        addToast(payload);
+
+        // Broadcast to other open browser tabs
+        if (broadcastChannelRef.current) {
+          broadcastChannelRef.current.postMessage({
+            type: 'NEW_NOTIFICATION',
+            payload
+          });
+        }
+      } catch (err) {
+        console.warn('[SSE] Error parsing notification event:', err);
+      }
+    });
+
+    es.onerror = () => {
+      // EventSource automatically handles reconnection
+      console.debug('[SSE] Stream disconnected or retrying...');
+    };
+
+    return () => {
+      es.close();
+      eventSourceRef.current = null;
+    };
+  }, [token, user, addToast]);
+
+  // Fallback & multi-tab redundancy via Socket.IO
+  useEffect(() => {
+    if (!token || !user) return;
+
+    const socket = getSocket();
+    const handleSocketNotification = (payload: any) => {
+      if (!payload) return;
+      // Filter if targeted to another user
+      if (payload.userId && payload.userId !== user.id) {
+        return;
+      }
+
+      addToast(payload);
+
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({
+          type: 'NEW_NOTIFICATION',
+          payload
+        });
+      }
+    };
+
+    socket.on('notification:new', handleSocketNotification);
+
+    return () => {
+      socket.off('notification:new', handleSocketNotification);
+    };
+  }, [token, user, addToast]);
 
   return (
     <NotificationContext.Provider
@@ -133,38 +324,13 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ 
         markAsRead,
         markAllAsRead,
         dismissToast,
-        addToast
+        clickToast,
+        addToast,
+        refreshNotifications,
+        setOnSelectTicketCallback
       }}
     >
       {children}
-      {/* Toast Notification Container */}
-      <div className="fixed bottom-5 right-5 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none">
-        {toasts.map((toast) => (
-          <div
-            key={toast.id}
-            className={`pointer-events-auto p-4 rounded-xl shadow-2xl border backdrop-blur-md transition-all duration-300 transform translate-y-0 ${
-              toast.type === 'error'
-                ? 'bg-rose-950/90 border-rose-600/50 text-rose-100'
-                : toast.type === 'success'
-                ? 'bg-emerald-950/90 border-emerald-600/50 text-emerald-100'
-                : 'bg-slate-900/95 border-indigo-500/40 text-slate-100'
-            }`}
-          >
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <h4 className="font-semibold text-sm">{toast.title}</h4>
-                <p className="text-xs text-slate-300 mt-1 line-clamp-2">{toast.message}</p>
-              </div>
-              <button
-                onClick={() => dismissToast(toast.id)}
-                className="text-slate-400 hover:text-white text-xs p-1"
-              >
-                ✕
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
     </NotificationContext.Provider>
   );
 };
@@ -175,3 +341,4 @@ export const useNotification = () => {
   return ctx;
 };
 
+export const useRealtimeNotifications = useNotification;

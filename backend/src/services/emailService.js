@@ -1,69 +1,159 @@
 import nodemailer from 'nodemailer';
+import { prisma } from '../config/db.js';
 import { logger } from '../utils/logger.js';
 
 let transporter = null;
 
-function getTransporter() {
+export function getTransporter() {
   if (!transporter) {
-    const isMock = !process.env.SMTP_USER || process.env.SMTP_USER === 'support@example.com' || process.env.SMTP_HOST === 'localhost';
+    const host = process.env.SMTP_HOST || 'smtp.gmail.com';
+    const port = parseInt(process.env.SMTP_PORT || '465', 10);
+    const secure = process.env.SMTP_SECURE === 'true' || port === 465;
+    const user = process.env.SMTP_USER || process.env.SUPPORT_EMAIL || 'chandra2001ks@gmail.com';
+   const pass = process.env.SMTP_PASS;
 
-    if (isMock) {
-      // Use JSON transport for mock/development testing without an external mail server
+    if (pass) {
+      transporter = nodemailer.createTransport({
+        host,
+        port,
+        secure,
+        auth: {
+          user,
+          pass
+        }
+      });
+      logger.info(`[Email Service] Configured Gmail SMTP: ${host}:${port} (secure: ${secure})`);
+    } else {
       transporter = nodemailer.createTransport({
         jsonTransport: true
       });
       logger.info('[Email Service] Configured in Development/Mock JSON transport mode');
-    } else {
-      transporter = nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: parseInt(process.env.SMTP_PORT || '587', 10),
-        secure: process.env.SMTP_PORT === '465',
-        auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASS
-        }
-      });
-      logger.info(`[Email Service] Configured with SMTP: ${process.env.SMTP_HOST}:${process.env.SMTP_PORT}`);
     }
   }
   return transporter;
 }
 
 /**
- * Send email (acknowledgement or agent reply)
+ * Startup helper to verify SMTP connection
  */
-export async function sendEmail({ to, subject, text, html, inReplyTo, references }) {
+export async function verifySmtpConnection() {
   try {
     const mailer = getTransporter();
-    const fromAddress = process.env.SMTP_FROM || 'IT Support Desk <support@example.com>';
+    if (mailer.verify) {
+      await mailer.verify();
+      logger.info('✓ Gmail SMTP connection: CONNECTED and verified');
+      return true;
+    }
+    return true;
+  } catch (error) {
+    logger.error(`✗ Gmail SMTP connection failed: ${error?.message || error}`);
+    return false;
+  }
+}
 
-    logger.info(`[Email Outbound] To: ${to} | Subject: "${subject}"`);
+/**
+ * Send email (acknowledgement or agent reply) with strict threading headers and DB tracking
+ */
+export async function sendEmail({
+  to,
+  subject,
+  text,
+  html,
+  inReplyTo,
+  references,
+  ticketId,
+  ticketMessageId
+}) {
+  const fromName = process.env.SMTP_FROM_NAME || 'Enterprise CRM Support';
+  const fromEmail = process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER || 'chandra2001ks@gmail.com';
+  const fromAddress = `"${fromName}" <${fromEmail}>`;
+
+  // Generate standardized unique Message-ID
+  const domain = fromEmail.includes('@') ? fromEmail.split('@')[1] : 'gmail.com';
+  const generatedMessageId = `<crm-out-${Date.now()}-${Math.random().toString(36).substring(2, 9)}@${domain}>`;
+
+  logger.info(`[Email Outbound] Preparing email to: ${to} | Subject: "${subject}" | In-Reply-To: ${inReplyTo || 'none'}`);
+
+  // Create EmailMessage record in PENDING status
+  let emailRecord = null;
+  try {
+    emailRecord = await prisma.emailMessage.create({
+      data: {
+        ticketId: ticketId || null,
+        ticketMessageId: ticketMessageId || null,
+        direction: 'OUTBOUND',
+        fromAddress,
+        toAddress: to,
+        senderEmail: fromEmail,
+        recipientEmail: to,
+        subject,
+        bodyText: text || '',
+        bodyHtml: html || (text ? `<div style="font-family: sans-serif; line-height: 1.5; color: #333;">${text.replace(/\n/g, '<br/>')}</div>` : ''),
+        messageId: generatedMessageId,
+        providerMessageId: generatedMessageId,
+        inReplyTo: inReplyTo || null,
+        references: references || null,
+        status: 'PENDING'
+      }
+    });
+  } catch (dbErr) {
+    logger.warn(`[Email Outbound] Failed to create pending EmailMessage: ${dbErr?.message}`);
+  }
+
+  try {
+    const mailer = getTransporter();
 
     const mailOptions = {
       from: fromAddress,
       to,
       subject,
       text,
-      html: html || `<div style="font-family: sans-serif; line-height: 1.5; color: #333;">${text.replace(/\n/g, '<br/>')}</div>`,
-      inReplyTo,
-      references
+      html: html || (text ? `<div style="font-family: sans-serif; line-height: 1.5; color: #333;">${text.replace(/\n/g, '<br/>')}</div>` : ''),
+      messageId: generatedMessageId,
+      inReplyTo: inReplyTo || undefined,
+      references: references || undefined
     };
 
     const info = await mailer.sendMail(mailOptions);
-    logger.info(`[Email Outbound] Sent successfully. MessageId: ${info.messageId}`);
-    return { success: true, messageId: info.messageId };
+    const actualMessageId = info.messageId || generatedMessageId;
+
+    logger.info(`[Email Outbound] Sent successfully. MessageId: ${actualMessageId}`);
+
+    if (emailRecord) {
+      await prisma.emailMessage.update({
+        where: { id: emailRecord.id },
+        data: {
+          status: 'SENT',
+          providerMessageId: actualMessageId,
+          sentAt: new Date()
+        }
+      });
+    }
+
+    return { success: true, messageId: actualMessageId, emailRecordId: emailRecord?.id };
   } catch (error) {
-    logger.error('[Email Outbound Error]', error.message);
-    return { success: false, error: error.message };
+    logger.error(`[Email Outbound Error] ${error?.message || error}`);
+
+    if (emailRecord) {
+      await prisma.emailMessage.update({
+        where: { id: emailRecord.id },
+        data: {
+          status: 'FAILED',
+          errorMessage: error?.message || 'SMTP delivery failed',
+          failureReason: error?.message || 'SMTP delivery failed'
+        }
+      });
+    }
+
+    return { success: false, error: error?.message || 'Failed to send email' };
   }
 }
 
 /**
- * Parse incoming webhook email payload (supports common providers: Mailgun, SendGrid, Postmark, and raw JSON)
+ * Parse incoming webhook email payload (supports SendGrid, Mailgun, Postmark, and raw CRM JSON)
  */
 export function parseIncomingEmailPayload(body) {
   try {
-    // 1. SendGrid Inbound Parse format
     if (body.from && (body.text || body.html)) {
       const fromRaw = body.from;
       let senderEmail = fromRaw;
@@ -92,7 +182,6 @@ export function parseIncomingEmailPayload(body) {
       };
     }
 
-    // 2. Direct clean CRM JSON payload
     if (body.senderEmail && (body.messageText || body.body)) {
       return {
         channel: 'EMAIL',
@@ -113,4 +202,3 @@ export function parseIncomingEmailPayload(body) {
     return null;
   }
 }
-
